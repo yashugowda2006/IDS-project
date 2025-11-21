@@ -1,0 +1,151 @@
+import os
+import sys
+import time
+import logging
+from datetime import datetime
+from scapy.all import sniff, IP, TCP, UDP, ICMP, Raw
+
+# --- CONFIGURATION ---
+# File where alerts will be saved
+LOG_FILE = "ids_log.txt"
+
+# sensitive ports to watch (e.g., 21=FTP, 22=SSH, 23=Telnet, 80=HTTP)
+SENSITIVE_PORTS = [21, 22, 23, 445, 3389]
+
+# Keywords to look for in packet payloads (Basic Signature Matching)
+# In a real system, these would be regex patterns or hashes.
+SUSPICIOUS_KEYWORDS = [
+    b"password",
+    b"user",
+    b"admin",
+    b"root",
+    b"union select", # SQL Injection
+    b"alert(",       # XSS
+    b"/etc/passwd"   # Path traversal
+]
+
+# --- LOGGING SETUP ---
+logging.basicConfig(
+    filename=LOG_FILE,
+    level=logging.INFO,
+    format='%(asctime)s - %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S'
+)
+
+def log_alert(message):
+    """Logs the alert to file and prints to console."""
+    print(f"[!] ALERT: {message}")
+    logging.info(message)
+
+# --- DETECTION ENGINES ---
+
+def detect_tcp_scan(packet):
+    """
+    Detects TCP Null Scans and Xmas Scans.
+    Attackers use these to identify open ports without completing a handshake.
+    """
+    if packet.haslayer(TCP):
+        flags = packet[TCP].flags
+        
+        # NULL Scan: No flags are set (0)
+        if flags == 0:
+            return f"TCP Null Scan Detected from {packet[IP].src} -> {packet[IP].dst}"
+            
+        # Xmas Scan: FIN, URG, and PUSH flags are set (FPU)
+        if flags == 0x29: # 0x29 is hex for FIN, PUSH, URG
+            return f"TCP Xmas Scan Detected from {packet[IP].src} -> {packet[IP].dst}"
+            
+    return None
+
+def detect_sensitive_ports(packet):
+    """
+    Detects attempts to connect to known sensitive ports.
+    """
+    if packet.haslayer(TCP):
+        dst_port = packet[TCP].dport
+        if dst_port in SENSITIVE_PORTS:
+            return f"Connection attempt to sensitive port {dst_port} (Service) from {packet[IP].src}"
+    return None
+
+def detect_payload_signatures(packet):
+    """
+    Inspects the raw payload for suspicious keywords (Basic Deep Packet Inspection).
+    """
+    if packet.haslayer(Raw):
+        try:
+            # Get the payload data
+            load = packet[Raw].load
+            
+            # Check for keywords
+            for keyword in SUSPICIOUS_KEYWORDS:
+                if keyword in load.lower():
+                    return f"Suspicious payload found: '{keyword.decode('utf-8', errors='ignore')}' from {packet[IP].src}"
+        except Exception:
+            # Packet payload might not be decode-able text, ignore errors
+            pass
+    return None
+
+def detect_icmp_flood(packet):
+    """
+    Basic detection for high volume ICMP (Ping) traffic.
+    (Simplified: Just alerts on every ping for demonstration).
+    """
+    if packet.haslayer(ICMP):
+        if packet[ICMP].type == 8: # Echo Request (Ping)
+            return f"ICMP Echo Request (Ping) detected from {packet[IP].src}"
+    return None
+
+# --- MAIN PACKET PROCESSING ---
+
+def process_packet(packet):
+    """
+    Callback function applied to every captured packet.
+    """
+    # We only care about IP traffic
+    if not packet.haslayer(IP):
+        return
+
+    alerts = []
+
+    # Run detection modules
+    alerts.append(detect_tcp_scan(packet))
+    alerts.append(detect_sensitive_ports(packet))
+    alerts.append(detect_payload_signatures(packet))
+    alerts.append(detect_icmp_flood(packet))
+
+    # If any alert was generated, log it
+    for alert in alerts:
+        if alert:
+            log_alert(alert)
+
+def start_ids(interface=None):
+    """
+    Starts the sniffing process.
+    """
+    print(f"[*] Starting Simple IDS...")
+    print(f"[*] Logging alerts to: {os.path.abspath(LOG_FILE)}")
+    if interface:
+        print(f"[*] Listening on Interface: {interface}")
+    else:
+        print(f"[*] Listening on Default Interface")
+    
+    print("[*] Press Ctrl+C to stop.")
+    
+    try:
+        # store=False prevents keeping packets in memory (which would crash RAM eventually)
+        # iface=interface can be used to sniff specific Wi-Fi/Eth adapters
+        sniff(prn=process_packet, store=False, iface=interface)
+    except KeyboardInterrupt:
+        print("\n[*] Stopping IDS. Exiting...")
+        sys.exit(0)
+    except Exception as e:
+        print(f"\n[!] Error: {e}")
+        print("[!] Ensure you are running this script as Administrator/Root.")
+
+if __name__ == "__main__":
+    # Optional: Pass interface name as argument (e.g., python simple_ids.py eth0)
+    iface = None
+    if len(sys.argv) > 1:
+        iface = sys.argv[1]
+        
+    start_ids(iface)
